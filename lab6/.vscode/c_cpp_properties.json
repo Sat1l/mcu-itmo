@@ -1,0 +1,16 @@
+{
+  "configurations": [
+    {
+      "name": "Mac",
+      "includePath": [
+        "/Applications/ArmGNUToolchain/14.3.rel1/arm-none-eabi/arm-none-eabi/include",
+        "/Users/sat/STM32/drivers/STM32F4/CMSIS/Device/ST/STM32F4xx/include",
+        "/Users/sat/STM32/drivers/STM32F4/CMSIS/include",
+        "./src/**"
+      ],
+      "defines": [],
+      "configurationProvider": "ms-vscode.makefile-tools"
+    }
+  ],
+  "version": 4
+}
