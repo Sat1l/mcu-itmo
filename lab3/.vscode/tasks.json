@@ -1,0 +1,28 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build",
+            "type": "shell",
+            "command": "make build",
+        },
+
+        {
+            "label": "Flash",
+            "type": "shell",
+            "command": "make flash",
+        },
+
+        {
+            "label": "Erase",
+            "type": "shell",
+            "command": "make erase",
+        },
+
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "make clean",
+        }
+    ]
+}
