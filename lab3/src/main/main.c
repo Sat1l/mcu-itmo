@@ -7,9 +7,7 @@
 #include <ctype.h>
 
 #define UART_BAUD 38400U
-
 #define N_SAMPLES 256U
-
 #define VREF_V 3.3f
 
 #define LED_PORT GPIOA
@@ -24,6 +22,7 @@ static volatile uint16_t lut[N_SAMPLES];
 static volatile uint32_t lut_idx = 0;
 
 static volatile float target_freq_hz = 30.0f;
+/* A means Vmax on DAC_OUT: waveform 0..A volts */
 static volatile float target_amp_v   = 3.0f;
 
 static volatile uint32_t led_div_reload = 1;
@@ -39,10 +38,14 @@ static void delay_cycles(volatile uint32_t n) {
 }
 
 static void FPU_Enable(void) {
-    SCB->CPACR |= (3UL << (10 * 2)) | (3UL << (11 * 2));
+    SCB->CPACR |= (3UL << (10U * 2U)) | (3UL << (11U * 2U));
 }
 
-static void SystemClock_Config_180MHz(void) {
+/* HSE = 16 MHz -> 180 MHz:
+   PLLM=16, PLLN=360, PLLP=2
+   APB1=45MHz (timer clocks 90MHz), APB2=90MHz
+*/
+static void SystemClock_Config_180MHz_HSE16(void) {
     RCC->CR |= RCC_CR_HSEON;
     while (!(RCC->CR & RCC_CR_HSERDY)) {}
 
@@ -54,11 +57,11 @@ static void SystemClock_Config_180MHz(void) {
     RCC->CFGR |= RCC_CFGR_PPRE2_DIV2;
 
     RCC->PLLCFGR = 0;
-    RCC->PLLCFGR |= (16U << RCC_PLLCFGR_PLLM_Pos);
+    RCC->PLLCFGR |= (16U  << RCC_PLLCFGR_PLLM_Pos);
     RCC->PLLCFGR |= (360U << RCC_PLLCFGR_PLLN_Pos);
-    RCC->PLLCFGR |= (0U << RCC_PLLCFGR_PLLP_Pos);
-    RCC->PLLCFGR |= RCC_PLLCFGR_PLLSRC_HSE;
-    RCC->PLLCFGR |= (7U << RCC_PLLCFGR_PLLQ_Pos);
+    RCC->PLLCFGR |= (0U   << RCC_PLLCFGR_PLLP_Pos);   /* PLLP = 2 */
+    RCC->PLLCFGR |= R CC_PLLCFGR_PLLSRC_HSE;
+    RCC->PLLCFGR |= (7U   << RCC_PLLCFGR_PLLQ_Pos);
 
     RCC->CR |= RCC_CR_PLLON;
     while (!(RCC->CR & RCC_CR_PLLRDY)) {}
@@ -74,15 +77,18 @@ static void RCC_EnablePeripherals(void) {
 }
 
 static void GPIO_Config(void) {
-    LED_PORT->MODER &= ~(3U << (LED_PIN * 2));
-    LED_PORT->MODER |=  (1U << (LED_PIN * 2));
+    /* LED PA5 output */
+    LED_PORT->MODER &= ~(3U << (LED_PIN * 2U));
+    LED_PORT->MODER |=  (1U << (LED_PIN * 2U));
     LED_PORT->OTYPER &= ~(1U << LED_PIN);
-    LED_PORT->PUPDR  &= ~(3U << (LED_PIN * 2));
+    LED_PORT->PUPDR  &= ~(3U << (LED_PIN * 2U));
 
-    GPIOA->MODER &= ~(3U << (DAC_PIN * 2));
-    GPIOA->MODER |=  (3U << (DAC_PIN * 2));
-    GPIOA->PUPDR &= ~(3U << (DAC_PIN * 2));
+    /* DAC PA4 analog */
+    DAC_PORT->MODER &= ~(3U << (DAC_PIN * 2U));
+    DAC_PORT->MODER |=  (3U << (DAC_PIN * 2U));
+    DAC_PORT->PUPDR &= ~(3U << (DAC_PIN * 2U));
 
+    /* USART2 PA2/PA3 AF7 */
     GPIOA->MODER &= ~(0xFU << (2U * 2U));
     GPIOA->MODER |=  (0xAU << (2U * 2U));
 
@@ -90,7 +96,7 @@ static void GPIO_Config(void) {
     GPIOA->AFR[0] |=  ((7U   << (2U * 4U)) | (7U   << (3U * 4U)));
 
     GPIOA->PUPDR &= ~(0xFU << (2U * 2U));
-    GPIOA->PUPDR |=  (0x5U << (2U * 2U));
+    GPIOA->PUPDR |=  (0x5U << (2U * 2U)); /* RX pull-up */
 }
 
 static void USART2_Config(uint32_t baud) {
@@ -98,7 +104,10 @@ static void USART2_Config(uint32_t baud) {
     USART2->CR2 = 0;
     USART2->CR3 = 0;
 
+    /* PCLK1 = 45 MHz (SYS=180, APB1 presc=4) */
     uint32_t pclk1 = 45000000U;
+
+    /* oversampling by 16, simple BRR integer is OK here */
     uint32_t usartdiv = (pclk1 + (baud / 2U)) / baud;
     USART2->BRR = usartdiv;
 
@@ -115,30 +124,44 @@ static void USART2_SendString(const char *s) {
     while (*s) USART2_SendByte((uint8_t)*s++);
 }
 
-static void DAC_Config(void) {
-    DAC->CR = 0;
+static void DAC1_Config(void) {
+    /* disable ch1 before config */
+    DAC->CR &= ~DAC_CR_EN1;
+
+    /* disable noise/triangle/trigger, enable buffer */
+    DAC->CR &= ~(DAC_CR_WAVE1 | DAC_CR_TSEL1 | DAC_CR_TEN1);
+    DAC->CR &= ~DAC_CR_BOFF1; /* buffer ON */
+
+    /* enable ch1 */
     DAC->CR |= DAC_CR_EN1;
-    DAC->DHR12R1 = 2048U;
+
+    DAC->DHR12R1 = 0U;
 }
 
-static void build_sine_lut(float amp_v, float vref_v) {
-    float a = amp_v;
+/* Build unipolar sine 0..A volts, where A = Vmax */
+static void build_sine_lut(float vmax_v, float vref_v) {
+    float a = vmax_v;
     if (a < 0.0f) a = 0.0f;
     if (a > vref_v) a = vref_v;
 
-    float peak = (a / vref_v) * 2047.0f;
-    float mid  = 2048.0f;
+    /* y_code = (A/Vref) * (4095/2) * (1 + sin)
+       Use 2047.5 = 4095/2 for best scaling.
+    */
+    float k = (a / vref_v) * 2047.5f;
 
     for (uint32_t i = 0; i < N_SAMPLES; i++) {
         float x = (2.0f * 3.14159265358979323846f) * ((float)i / (float)N_SAMPLES);
-        float y = mid + peak * sinf(x);
+        float y = k * (1.0f + sinf(x));  /* 0..2k => 0..A */
+
         if (y < 0.0f) y = 0.0f;
         if (y > 4095.0f) y = 4095.0f;
+
         lut[i] = (uint16_t)(y + 0.5f);
     }
 }
 
 static uint32_t TIM6_GetClockHz(void) {
+    /* APB1 timer clock = 90 MHz when SYS=180 and APB1 presc=4 */
     return 90000000U;
 }
 
@@ -159,11 +182,14 @@ static void TIM6_Config_FromFreq(float sine_hz) {
     for (uint32_t psc = 0; psc <= 0xFFFFU; psc++) {
         uint32_t t = timclk / (psc + 1U);
         if (t < target) break;
+
         uint32_t arr = (t / target);
         if (arr == 0) arr = 1;
         if (arr > 0x10000U) continue;
+
         uint32_t real = t / arr;
         uint32_t err = (real > target) ? (real - target) : (target - real);
+
         if (err < best_err) {
             best_err = err;
             best_psc = psc;
@@ -183,6 +209,7 @@ static void TIM6_Config_FromFreq(float sine_hz) {
     float tim6_fs_hz = (float)timclk / ((float)(best_psc + 1U) * (float)(best_arr + 1U));
     float ticks_per_toggle = tim6_fs_hz / led_toggle_hz;
     if (ticks_per_toggle < 1.0f) ticks_per_toggle = 1.0f;
+
     led_div_reload = (uint32_t)(ticks_per_toggle + 0.5f);
     if (led_div_reload == 0) led_div_reload = 1;
     led_div_counter = 0;
@@ -191,6 +218,7 @@ static void TIM6_Config_FromFreq(float sine_hz) {
 static void NVIC_Enable_Interrupts(void) {
     NVIC_SetPriority(TIM6_DAC_IRQn, 2);
     NVIC_EnableIRQ(TIM6_DAC_IRQn);
+
     NVIC_SetPriority(USART2_IRQn, 3);
     NVIC_EnableIRQ(USART2_IRQn);
 }
@@ -210,6 +238,11 @@ static void trim_inplace(char *s) {
 static void process_line(char *line) {
     trim_inplace(line);
     if (line[0] == '\0') return;
+
+    /* accept comma as decimal separator */
+    for (char *p = line; *p; p++) {
+        if (*p == ',') *p = '.';
+    }
 
     if ((line[0] == 'F' || line[0] == 'f') && line[1] == '=') {
         float f = strtof(&line[2], NULL);
@@ -236,8 +269,9 @@ static void process_line(char *line) {
     }
 
     if (strcasecmp(line, "status") == 0) {
-        char out[80];
-        int n = snprintf(out, sizeof(out), "F=%.3f Hz, A=%.3f V\r\n", (double)target_freq_hz, (double)target_amp_v);
+        char out[96];
+        int n = snprintf(out, sizeof(out), "F=%.3f Hz, A=%.3f V (Vmax)\r\n",
+                         (double)target_freq_hz, (double)target_amp_v);
         if (n > 0) USART2_SendString(out);
         return;
     }
@@ -263,6 +297,7 @@ void USART2_IRQHandler(void) {
     if (USART2->SR & USART_SR_RXNE) {
         char c = (char)USART2->DR;
 
+        /* echo */
         while (!(USART2->SR & USART_SR_TXE)) {}
         USART2->DR = (uint8_t)c;
 
@@ -270,7 +305,7 @@ void USART2_IRQHandler(void) {
 
         if (c == '\r' || c == '\n') {
             if (rxlen < RXBUF_SIZE - 1U) {
-                rxbuf[rxlen++] = '\n';
+                rxbuf[rxlen] = '\0';
                 cmd_ready = 1;
             } else {
                 rxlen = 0;
@@ -295,7 +330,7 @@ void USART2_IRQHandler(void) {
 
 int main(void) {
     FPU_Enable();
-    SystemClock_Config_180MHz();
+    SystemClock_Config_180MHz_HSE16();
 
     RCC_EnablePeripherals();
     GPIO_Config();
@@ -303,7 +338,7 @@ int main(void) {
     build_sine_lut(target_amp_v, VREF_V);
 
     USART2_Config(UART_BAUD);
-    DAC_Config();
+    DAC1_Config();
 
     NVIC_Enable_Interrupts();
     TIM6_Config_FromFreq(target_freq_hz);
@@ -311,11 +346,12 @@ int main(void) {
     delay_cycles(2000000);
 
     USART2_SendString("Lab3 ready\r\n");
-    USART2_SendString("F=<0.5..2000>  A=<0..3.3>  status\r\n");
+    USART2_SendString("Commands: F=<0.5..2000>  A=<0..3.3> (Vmax)  status\r\n");
 
     for (;;) {
         if (cmd_ready) {
             char line[RXBUF_SIZE];
+
             uint32_t n = rxlen;
             if (n >= RXBUF_SIZE) n = RXBUF_SIZE - 1U;
 
