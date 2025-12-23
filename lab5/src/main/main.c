@@ -1,176 +1,154 @@
 #include "stm32f446xx.h"
 #include <stdint.h>
 #include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <ctype.h>
+#include <math.h>
 
-#define SYSCLK_HZ           180000000U
-#define APB1_PRESC          4U
-#define PCLK1_HZ            (SYSCLK_HZ / APB1_PRESC)
-#define TIM_APB1_HZ         (PCLK1_HZ * 2U)
+#define CPU_HZ              40000000UL
+#define APB1_HZ             (CPU_HZ / 2UL)
+#define TIM_APB1_TIMCLK_HZ  (APB1_HZ * 2UL)
 
-#define UART_BAUD           1000000U
+#define UART_BAUD           1000000UL
 
-#define PWM_HZ              1000U
-#define TELEMETRY_HZ        1000U
+#define PWM_HZ              1000UL
+#define PWM_ARR             (TIM_APB1_TIMCLK_HZ / PWM_HZ - 1UL)
 
-#define RX_DMA_BUF_SZ       256U
-#define TX_DMA_BUF_SZ       256U
+#define CTRL_HZ             1000UL
+#define TIM6_PSC            399UL
+#define TIM6_ARR            99UL
 
-#define ADC_DMA_CHS         2U
+#define ADC_LEN             2U
+#define ADC_IDX_EXT         0U   // PB0  ADC1_IN8
+#define ADC_IDX_MOTOR       1U   // PC0  ADC1_IN10
 
-static volatile uint16_t adc_dma[ADC_DMA_CHS];
-static volatile uint8_t  rx_dma[RX_DMA_BUF_SZ];
+#define ADC_MAX_F           4095.0f
+#define DEG_MAX_F           270.0f
 
-static volatile uint32_t rx_last_pos = 0;
+#define INVERT_TARGET       1
+#define INVERT_MOTOR        0
 
-static volatile uint8_t  pwm_percent = 0;
-static volatile uint8_t  dir_state   = 0;
+#define LIM_MIN_DEG         5.0f
+#define LIM_MAX_DEG         265.0f
+
+#define DEAD_ZONE_DEG       1.0f
+#define MIN_CMD_PCT         12.0f
+
+#define FILT_A              0.05f
+
+static volatile uint16_t adc_buf[ADC_LEN];
 
 static volatile uint8_t  tx_busy = 0;
-static uint8_t tx_buf[TX_DMA_BUF_SZ];
+static char tx_buf[128];
 
-static void clock_180mhz_hse16(void) {
-    RCC->CR |= RCC_CR_HSEON;
-    while (!(RCC->CR & RCC_CR_HSERDY)) {}
+static volatile float target_deg = 0.0f;
+static volatile float motor_deg  = 0.0f;
+static volatile float err_deg    = 0.0f;
+static volatile int16_t control  = 0;
 
-    FLASH->ACR = FLASH_ACR_ICEN | FLASH_ACR_DCEN | FLASH_ACR_PRFTEN | FLASH_ACR_LATENCY_5WS;
+static float ext_f = 0.0f;
+static float mot_f = 0.0f;
+
+static void clock_40mhz_hsi_pll(void) {
+    FLASH->ACR = FLASH_ACR_ICEN | FLASH_ACR_DCEN | FLASH_ACR_PRFTEN | FLASH_ACR_LATENCY_1WS;
 
     RCC->CFGR = 0;
-    RCC->CFGR |= RCC_CFGR_HPRE_DIV1;
-    RCC->CFGR |= RCC_CFGR_PPRE1_DIV4;
-    RCC->CFGR |= RCC_CFGR_PPRE2_DIV2;
+    RCC->CFGR |= RCC_CFGR_PPRE1_DIV2;
+
+    RCC->CR |= RCC_CR_HSION;
+    while (!(RCC->CR & RCC_CR_HSIRDY)) {}
+
+    RCC->CR &= ~RCC_CR_PLLON;
+    while (RCC->CR & RCC_CR_PLLRDY) {}
 
     RCC->PLLCFGR = 0;
-    RCC->PLLCFGR |= (16U  << RCC_PLLCFGR_PLLM_Pos);
-    RCC->PLLCFGR |= (360U << RCC_PLLCFGR_PLLN_Pos);
-    RCC->PLLCFGR |= (0U   << RCC_PLLCFGR_PLLP_Pos);
-    RCC->PLLCFGR |= RCC_PLLCFGR_PLLSRC_HSE;
-    RCC->PLLCFGR |= (7U   << RCC_PLLCFGR_PLLQ_Pos);
+    RCC->PLLCFGR |= (8UL   << RCC_PLLCFGR_PLLM_Pos);
+    RCC->PLLCFGR |= (160UL << RCC_PLLCFGR_PLLN_Pos);
+    RCC->PLLCFGR |= (3UL   << RCC_PLLCFGR_PLLP_Pos);
+    RCC->PLLCFGR |= (4UL   << RCC_PLLCFGR_PLLQ_Pos);
+    RCC->PLLCFGR |= RCC_PLLCFGR_PLLSRC_HSI;
 
     RCC->CR |= RCC_CR_PLLON;
     while (!(RCC->CR & RCC_CR_PLLRDY)) {}
 
-    RCC->CFGR &= ~RCC_CFGR_SW;
-    RCC->CFGR |= RCC_CFGR_SW_PLL;
-    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) {}
+    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW_Msk) | RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_PLL) {}
 }
 
 static void gpio_init(void) {
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOCEN;
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
 
-    // PA0 TIM2_CH1 (AF1) PWM
-    GPIOA->MODER &= ~(3U << (0U * 2U));
-    GPIOA->MODER |=  (2U << (0U * 2U));
-    GPIOA->AFR[0] &= ~(0xFU << (0U * 4U));
-    GPIOA->AFR[0] |=  (1U   << (0U * 4U));
+    GPIOA->MODER &= ~((3UL << (2U*2U)) | (3UL << (3U*2U)));
+    GPIOA->MODER |=  ((2UL << (2U*2U)) | (2UL << (3U*2U)));
+    GPIOA->AFR[0] &= ~((0xFUL << (2U*4U)) | (0xFUL << (3U*4U)));
+    GPIOA->AFR[0] |=  ((7UL   << (2U*4U)) | (7UL   << (3U*4U)));
 
-    // PA1 DIR1 (output)
-    GPIOA->MODER &= ~(3U << (1U * 2U));
-    GPIOA->MODER |=  (1U << (1U * 2U));
-    GPIOA->OTYPER &= ~(1U << 1U);
+    GPIOB->MODER &= ~(3UL << (10U*2U));
+    GPIOB->MODER |=  (2UL << (10U*2U));
+    GPIOB->AFR[1] &= ~(0xFUL << ((10U-8U)*4U));
+    GPIOB->AFR[1] |=  (1UL   << ((10U-8U)*4U));
 
-    // PA2/PA3 USART2 AF7
-    GPIOA->MODER &= ~(3U << (2U * 2U));
-    GPIOA->MODER &= ~(3U << (3U * 2U));
-    GPIOA->MODER |=  (2U << (2U * 2U)) | (2U << (3U * 2U));
-    GPIOA->AFR[0] &= ~((0xFU << (2U * 4U)) | (0xFU << (3U * 4U)));
-    GPIOA->AFR[0] |=  ((7U   << (2U * 4U)) | (7U   << (3U * 4U)));
+    GPIOA->MODER &= ~(3UL << (8U*2U));
+    GPIOA->MODER |=  (1UL << (8U*2U));
+    GPIOA->BSRR = (1UL << (8U+16U));
 
-    // PC2, PC3 analog (ADC)
-    GPIOC->MODER |= (3U << (2U * 2U)) | (3U << (3U * 2U));
-    GPIOC->PUPDR &= ~((3U << (2U * 2U)) | (3U << (3U * 2U)));
+    GPIOB->MODER |= (3UL << (0U*2U));
+    GPIOC->MODER |= (3UL << (0U*2U));
 }
 
 static void tim2_pwm_init(void) {
     RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
 
-    uint32_t psc = (TIM_APB1_HZ / 1000000U) - 1U; // 1 MHz timer tick
-    uint32_t arr = (1000000U / PWM_HZ) - 1U;      // 1 kHz
+    TIM2->PSC = 0;
+    TIM2->ARR = PWM_ARR;
 
-    TIM2->CR1 = 0;
-    TIM2->PSC = psc;
-    TIM2->ARR = arr;
+    TIM2->CCMR2 = (TIM2->CCMR2 & ~(7UL << 4)) | (6UL << 4) | TIM_CCMR2_OC3PE;
+    TIM2->CCER |= TIM_CCER_CC3E;
 
-    TIM2->CCMR1 = 0;
-    TIM2->CCMR1 |= (6U << TIM_CCMR1_OC1M_Pos);
-    TIM2->CCMR1 |= TIM_CCMR1_OC1PE;
-
-    TIM2->CCER = 0;
-    TIM2->CCER |= TIM_CCER_CC1E;
-
-    TIM2->CCR1 = 0;
-
+    TIM2->CCR3 = 0;
     TIM2->EGR = TIM_EGR_UG;
-    TIM2->CR1 |= TIM_CR1_ARPE;
-    TIM2->CR1 |= TIM_CR1_CEN;
+    TIM2->CR1 |= TIM_CR1_ARPE | TIM_CR1_CEN;
 }
 
-static void pwm_set_percent(uint8_t pct) {
-    if (pct > 100U) pct = 100U;
-    pwm_percent = pct;
-    uint32_t arr = TIM2->ARR;
-    uint32_t ccr = (pct * (arr + 1U)) / 100U;
-    if (ccr > arr) ccr = arr;
-    TIM2->CCR1 = ccr;
-}
-
-static void dir_set(uint8_t dir) {
-    dir_state = (dir ? 1U : 0U);
-    if (dir_state) GPIOA->BSRR = (1U << 1U);
-    else           GPIOA->BSRR = (1U << (1U + 16U));
-}
-
-static void adc1_dma_init(void) {
+static void adc1_dma_init_in8_in10(void) {
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
     RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;
 
-    ADC->CCR = 0;
-    ADC->CCR |= (3U << ADC_CCR_ADCPRE_Pos);
-
-    ADC1->CR1 = 0;
-    ADC1->CR2 = 0;
-
-    ADC1->SMPR1 = 0;
-    ADC1->SMPR1 |= (4U << ADC_SMPR1_SMP12_Pos);
-    ADC1->SMPR1 |= (4U << ADC_SMPR1_SMP13_Pos);
-
-    ADC1->SQR1 = 0;
-    ADC1->SQR1 |= (1U << ADC_SQR1_L_Pos);
-
-    ADC1->SQR3 = 0;
-    ADC1->SQR3 |= (12U << 0);
-    ADC1->SQR3 |= (13U << 5);
+    ADC->CCR &= ~ADC_CCR_ADCPRE_Msk;
+    ADC->CCR |=  ADC_CCR_ADCPRE_0;
 
     DMA2_Stream0->CR &= ~DMA_SxCR_EN;
     while (DMA2_Stream0->CR & DMA_SxCR_EN) {}
+    DMA2->LIFCR = DMA_LIFCR_CTCIF0 | DMA_LIFCR_CHTIF0 | DMA_LIFCR_CTEIF0 |
+                  DMA_LIFCR_CDMEIF0 | DMA_LIFCR_CFEIF0;
 
     DMA2_Stream0->PAR  = (uint32_t)&ADC1->DR;
-    DMA2_Stream0->M0AR = (uint32_t)adc_dma;
-    DMA2_Stream0->NDTR = ADC_DMA_CHS;
+    DMA2_Stream0->M0AR = (uint32_t)adc_buf;
+    DMA2_Stream0->NDTR = ADC_LEN;
 
-    DMA2_Stream0->CR = 0;
-    DMA2_Stream0->CR |= (0U << DMA_SxCR_CHSEL_Pos);
-    DMA2_Stream0->CR |= DMA_SxCR_PL_1;
-    DMA2_Stream0->CR |= DMA_SxCR_MSIZE_0;
-    DMA2_Stream0->CR |= DMA_SxCR_PSIZE_0;
-    DMA2_Stream0->CR |= DMA_SxCR_MINC;
-    DMA2_Stream0->CR |= DMA_SxCR_CIRC;
-    DMA2_Stream0->CR |= (0U << DMA_SxCR_DIR_Pos);
+    DMA2_Stream0->CR = (0UL << DMA_SxCR_CHSEL_Pos) |
+                       (0UL << DMA_SxCR_DIR_Pos)   |
+                       DMA_SxCR_MINC | DMA_SxCR_CIRC |
+                       (1UL << DMA_SxCR_PL_Pos) |
+                       DMA_SxCR_MSIZE_0 | DMA_SxCR_PSIZE_0;
+    DMA2_Stream0->FCR = 0;
+
+    ADC1->CR1 = ADC_CR1_SCAN;
+
+    ADC1->SMPR2 = 0;
+    ADC1->SMPR1 = 0;
+    ADC1->SMPR2 |= (7UL << (3U * 8U));
+    ADC1->SMPR1 |= (7UL << (3U * 0U));
+
+    ADC1->SQR1 = (1UL << 20);
+    ADC1->SQR3 = (8UL << 0) | (10UL << 5);
+
+    ADC1->CR2 = ADC_CR2_CONT | ADC_CR2_DMA | ADC_CR2_DDS | ADC_CR2_EOCS;
 
     DMA2_Stream0->CR |= DMA_SxCR_EN;
-
-    ADC1->CR2 |= ADC_CR2_DMA | ADC_CR2_DDS;
-    ADC1->CR2 |= ADC_CR2_CONT;
     ADC1->CR2 |= ADC_CR2_ADON;
-
-    for (volatile uint32_t i = 0; i < 10000U; i++) {}
-
     ADC1->CR2 |= ADC_CR2_SWSTART;
 }
 
-static void usart2_dma_init(void) {
+static void usart2_dma_tx_init(void) {
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
     RCC->AHB1ENR |= RCC_AHB1ENR_DMA1EN;
 
@@ -178,223 +156,198 @@ static void usart2_dma_init(void) {
     USART2->CR2 = 0;
     USART2->CR3 = 0;
 
-    uint32_t brr = (PCLK1_HZ + (UART_BAUD / 2U)) / UART_BAUD;
-    USART2->BRR = brr;
+    USART2->BRR = (uint16_t)((APB1_HZ + (UART_BAUD / 2UL)) / UART_BAUD);
+    USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
 
-    // RX DMA: DMA1 Stream5 Channel4 (USART2_RX)
-    DMA1_Stream5->CR &= ~DMA_SxCR_EN;
-    while (DMA1_Stream5->CR & DMA_SxCR_EN) {}
-
-    DMA1_Stream5->PAR  = (uint32_t)&USART2->DR;
-    DMA1_Stream5->M0AR = (uint32_t)rx_dma;
-    DMA1_Stream5->NDTR = RX_DMA_BUF_SZ;
-
-    DMA1_Stream5->CR = 0;
-    DMA1_Stream5->CR |= (4U << DMA_SxCR_CHSEL_Pos);
-    DMA1_Stream5->CR |= DMA_SxCR_MINC;
-    DMA1_Stream5->CR |= DMA_SxCR_CIRC;
-    DMA1_Stream5->CR |= (0U << DMA_SxCR_DIR_Pos);
-    DMA1_Stream5->CR |= DMA_SxCR_PL_1;
-
-    DMA1_Stream5->CR |= DMA_SxCR_EN;
-
-    // TX DMA: DMA1 Stream6 Channel4 (USART2_TX)
     DMA1_Stream6->CR &= ~DMA_SxCR_EN;
     while (DMA1_Stream6->CR & DMA_SxCR_EN) {}
+    DMA1->HIFCR = 0xFFFFFFFFUL;
 
-    DMA1_Stream6->PAR  = (uint32_t)&USART2->DR;
-    DMA1_Stream6->M0AR = (uint32_t)tx_buf;
+    DMA1_Stream6->PAR = (uint32_t)&USART2->DR;
+    DMA1_Stream6->CR  = (4UL << DMA_SxCR_CHSEL_Pos) |
+                        (1UL << DMA_SxCR_DIR_Pos)   |
+                        DMA_SxCR_MINC |
+                        (1UL << DMA_SxCR_PL_Pos) |
+                        DMA_SxCR_TCIE;
 
-    DMA1_Stream6->CR = 0;
-    DMA1_Stream6->CR |= (4U << DMA_SxCR_CHSEL_Pos);
-    DMA1_Stream6->CR |= DMA_SxCR_MINC;
-    DMA1_Stream6->CR |= (1U << DMA_SxCR_DIR_Pos);
-    DMA1_Stream6->CR |= DMA_SxCR_PL_1;
-    DMA1_Stream6->CR |= DMA_SxCR_TCIE;
+    USART2->CR3 |= USART_CR3_DMAT;
 
-    USART2->CR3 |= USART_CR3_DMAR | USART_CR3_DMAT;
-
-    USART2->CR1 |= USART_CR1_RE | USART_CR1_TE;
-    USART2->CR1 |= USART_CR1_IDLEIE;
-    USART2->CR1 |= USART_CR1_UE;
-
-    NVIC_SetPriority(USART2_IRQn, 2);
-    NVIC_EnableIRQ(USART2_IRQn);
-
-    NVIC_SetPriority(DMA1_Stream6_IRQn, 3);
+    NVIC_SetPriority(DMA1_Stream6_IRQn, 6);
     NVIC_EnableIRQ(DMA1_Stream6_IRQn);
 }
 
-static void usart2_tx_dma_send(const uint8_t *data, uint32_t len) {
-    if (len == 0 || len > TX_DMA_BUF_SZ) return;
+static void uart2_send_dma(const char *s, uint16_t len) {
+    if (!len) return;
     if (tx_busy) return;
-
-    memcpy(tx_buf, data, len);
+    tx_busy = 1;
 
     DMA1_Stream6->CR &= ~DMA_SxCR_EN;
     while (DMA1_Stream6->CR & DMA_SxCR_EN) {}
+    DMA1->HIFCR = 0xFFFFFFFFUL;
 
-    DMA1->HIFCR = DMA_HIFCR_CTCIF6 | DMA_HIFCR_CHTIF6 | DMA_HIFCR_CTEIF6 | DMA_HIFCR_CDMEIF6 | DMA_HIFCR_CFEIF6;
-
+    DMA1_Stream6->M0AR = (uint32_t)s;
     DMA1_Stream6->NDTR = len;
-
-    tx_busy = 1;
     DMA1_Stream6->CR |= DMA_SxCR_EN;
 }
 
-static void tim7_telemetry_init(void) {
-    RCC->APB1ENR |= RCC_APB1ENR_TIM7EN;
-
-    uint32_t psc = (TIM_APB1_HZ / 1000000U) - 1U; // 1 MHz
-    uint32_t arr = (1000000U / TELEMETRY_HZ) - 1U;
-
-    TIM7->CR1 = 0;
-    TIM7->PSC = psc;
-    TIM7->ARR = arr;
-    TIM7->EGR = TIM_EGR_UG;
-    TIM7->SR = 0;
-    TIM7->DIER |= TIM_DIER_UIE;
-
-    NVIC_SetPriority(TIM7_IRQn, 4);
-    NVIC_EnableIRQ(TIM7_IRQn);
-
-    TIM7->CR1 |= TIM_CR1_CEN;
-}
-
-static void send_help(void) {
-    const char *s =
-        "Commands:\n"
-        "  pwm=0..100\n"
-        "  dir=0|1\n"
-        "  status\n"
-        "  help\n";
-    usart2_tx_dma_send((const uint8_t*)s, (uint32_t)strlen(s));
-}
-
-static void send_status(void) {
-    char out[128];
-    uint16_t a1 = adc_dma[0];
-    uint16_t a2 = adc_dma[1];
-    int n = snprintf(out, sizeof(out), "adc1=%u adc2=%u pwm=%u dir=%u\n", a1, a2, pwm_percent, dir_state);
-    if (n > 0) usart2_tx_dma_send((const uint8_t*)out, (uint32_t)n);
-}
-
-static void handle_line(char *line) {
-    while (*line && isspace((unsigned char)*line)) line++;
-    size_t L = strlen(line);
-    while (L && (line[L-1] == '\r' || line[L-1] == '\n' || isspace((unsigned char)line[L-1]))) {
-        line[L-1] = 0;
-        L--;
-    }
-    if (*line == 0) return;
-
-    if (!strcasecmp(line, "help")) { send_help(); return; }
-    if (!strcasecmp(line, "status")) { send_status(); return; }
-
-    if (!strncasecmp(line, "pwm=", 4)) {
-        long v = strtol(line + 4, NULL, 10);
-        if (v < 0) v = 0;
-        if (v > 100) v = 100;
-        pwm_set_percent((uint8_t)v);
-        const char *ok = "OK\n";
-        usart2_tx_dma_send((const uint8_t*)ok, 3);
-        return;
-    }
-
-    if (!strncasecmp(line, "dir=", 4)) {
-        long v = strtol(line + 4, NULL, 10);
-        dir_set((uint8_t)(v ? 1 : 0));
-        const char *ok = "OK\n";
-        usart2_tx_dma_send((const uint8_t*)ok, 3);
-        return;
-    }
-
-    const char *err = "ERR\n";
-    usart2_tx_dma_send((const uint8_t*)err, 4);
-}
-
-static void process_rx_dma(void) {
-    uint32_t pos = RX_DMA_BUF_SZ - DMA1_Stream5->NDTR;
-    if (pos == rx_last_pos) return;
-
-    static char line[128];
-    static uint32_t li = 0;
-
-    while (rx_last_pos != pos) {
-        uint8_t c = rx_dma[rx_last_pos];
-        rx_last_pos++;
-        if (rx_last_pos >= RX_DMA_BUF_SZ) rx_last_pos = 0;
-
-        if (c == '\r') continue;
-
-        if (c == '\n') {
-            line[li] = 0;
-            handle_line(line);
-            li = 0;
-            continue;
-        }
-
-        if (li < sizeof(line) - 1U) {
-            line[li++] = (char)c;
-        } else {
-            li = 0;
-        }
-    }
-}
-
-void USART2_IRQHandler(void) {
-    if (USART2->SR & USART_SR_IDLE) {
-        volatile uint32_t tmp = USART2->DR;
-        (void)tmp;
-        process_rx_dma();
-    }
-    if (USART2->SR & USART_SR_ORE) {
-        volatile uint32_t tmp = USART2->DR;
-        (void)tmp;
-    }
-}
-
 void DMA1_Stream6_IRQHandler(void) {
-    if (DMA1->HISR & DMA_HISR_TCIF6) {
-        DMA1->HIFCR = DMA_HIFCR_CTCIF6;
-        DMA1_Stream6->CR &= ~DMA_SxCR_EN;
-        tx_busy = 0;
-    }
-    if (DMA1->HISR & DMA_HISR_TEIF6) {
-        DMA1->HIFCR = DMA_HIFCR_CTEIF6;
+    if (DMA1->HISR & (DMA_HISR_TCIF6 | DMA_HISR_TEIF6)) {
+        DMA1->HIFCR = DMA_HIFCR_CTCIF6 | DMA_HIFCR_CTEIF6;
         DMA1_Stream6->CR &= ~DMA_SxCR_EN;
         tx_busy = 0;
     }
 }
 
-void TIM7_IRQHandler(void) {
-    if (TIM7->SR & TIM_SR_UIF) {
-        TIM7->SR &= ~TIM_SR_UIF;
+static void tim6_init_1khz(void) {
+    RCC->APB1ENR |= RCC_APB1ENR_TIM6EN;
 
-        char out[64];
-        uint16_t a1 = adc_dma[0];
-        uint16_t a2 = adc_dma[1];
-        int n = snprintf(out, sizeof(out), "%u %u %u %u\n", a1, a2, pwm_percent, dir_state);
-        if (n > 0) usart2_tx_dma_send((const uint8_t*)out, (uint32_t)n);
+    TIM6->PSC = TIM6_PSC;
+    TIM6->ARR = TIM6_ARR;
+
+    TIM6->DIER |= TIM_DIER_UIE;
+    NVIC_SetPriority(TIM6_DAC_IRQn, 5);
+    NVIC_EnableIRQ(TIM6_DAC_IRQn);
+
+    TIM6->CR1 |= TIM_CR1_CEN;
+}
+
+static void motor_set(int16_t spd) {
+    if (spd > 100) spd = 100;
+    if (spd < -100) spd = -100;
+
+    if (spd >= 0) GPIOA->BSRR = (1UL << 8);
+    else          GPIOA->BSRR = (1UL << (8 + 16));
+
+    uint32_t mag = (uint32_t)(spd >= 0 ? spd : -spd);
+
+    if (mag == 0) {
+        TIM2->CCR3 = 0;
+        return;
+    }
+
+    if (mag < (uint32_t)MIN_CMD_PCT) mag = (uint32_t)MIN_CMD_PCT;
+
+    uint32_t duty = (mag * (PWM_ARR + 1UL)) / 100UL;
+    if (duty > PWM_ARR) duty = PWM_ARR;
+
+    TIM2->CCR3 = duty;
+}
+
+static uint16_t u32_to_dec(char *p, uint32_t v) {
+    char t[10];
+    uint16_t n = 0;
+    if (v == 0) { p[0] = '0'; return 1; }
+    while (v) { t[n++] = (char)('0' + (v % 10U)); v /= 10U; }
+    for (uint16_t i = 0; i < n; i++) p[i] = t[n - 1U - i];
+    return n;
+}
+
+static uint16_t i32_to_dec(char *p, int32_t v) {
+    uint16_t n = 0;
+    if (v < 0) { p[n++] = '-'; v = -v; }
+    n += u32_to_dec(p + n, (uint32_t)v);
+    return n;
+}
+
+static uint16_t cdeg_to_str(char *p, int32_t cdeg) {
+    uint16_t n = 0;
+    if (cdeg < 0) { p[n++]='-'; cdeg = -cdeg; }
+    uint32_t ip = (uint32_t)(cdeg / 100);
+    uint32_t fp = (uint32_t)(cdeg % 100);
+    n += u32_to_dec(p + n, ip);
+    p[n++]='.';
+    p[n++] = (char)('0' + (fp / 10U));
+    p[n++] = (char)('0' + (fp % 10U));
+    return n;
+}
+
+static void telemetry_send(void) {
+    int32_t t = (int32_t)lroundf(target_deg * 100.0f);
+    int32_t c = (int32_t)lroundf(motor_deg  * 100.0f);
+    int32_t e = (int32_t)lroundf(err_deg    * 100.0f);
+
+    char *p = tx_buf;
+    uint16_t n = 0;
+
+    n += cdeg_to_str(p + n, t); p[n++]=',';
+    n += cdeg_to_str(p + n, c); p[n++]=',';
+    n += i32_to_dec (p + n, control); p[n++]=',';
+    n += cdeg_to_str(p + n, e); p[n++]=',';
+    n += u32_to_dec (p + n, adc_buf[ADC_IDX_EXT]); p[n++]=',';
+    n += u32_to_dec (p + n, adc_buf[ADC_IDX_MOTOR]);
+
+    p[n++] = '\r';
+    p[n++] = '\n';
+
+    uart2_send_dma(tx_buf, n);
+}
+
+static void ctrl_step(void) {
+    float ext = ((float)adc_buf[ADC_IDX_EXT]   * DEG_MAX_F) / ADC_MAX_F;
+    float mot = ((float)adc_buf[ADC_IDX_MOTOR] * DEG_MAX_F) / ADC_MAX_F;
+
+#if INVERT_TARGET
+    ext = DEG_MAX_F - ext;
+#endif
+#if INVERT_MOTOR
+    mot = DEG_MAX_F - mot;
+#endif
+
+    ext_f += FILT_A * (ext - ext_f);
+    mot_f += FILT_A * (mot - mot_f);
+
+    target_deg = ext_f;
+    motor_deg  = mot_f;
+
+    err_deg = target_deg - motor_deg;
+
+    float out = 0.0f;
+
+    float ae = fabsf(err_deg);
+    if (ae < DEAD_ZONE_DEG) {
+        out = 0.0f;
+    } else {
+        if (ae > 50.0f) out = 100.0f;
+        else out = ae * 2.0f;
+        out = copysignf(out, err_deg);
+    }
+
+    if (motor_deg <= LIM_MIN_DEG && out < 0.0f) out = 0.0f;
+    if (motor_deg >= LIM_MAX_DEG && out > 0.0f) out = 0.0f;
+
+    control = (int16_t)lroundf(out);
+    motor_set(control);
+}
+
+void TIM6_DAC_IRQHandler(void) {
+    if (TIM6->SR & TIM_SR_UIF) {
+        TIM6->SR &= ~TIM_SR_UIF;
+
+        ctrl_step();
+
+        static uint32_t div = 0;
+        div++;
+        if (div >= 10) {
+            div = 0;
+            telemetry_send();
+        }
     }
 }
 
 int main(void) {
-    SCB->CPACR |= (3UL << (10U * 2U)) | (3UL << (11U * 2U));
+    SCB->CPACR |= (3UL << (10U*2U)) | (3UL << (11U*2U));
 
-    clock_180mhz_hse16();
+    clock_40mhz_hsi_pll();
     gpio_init();
-
+    usart2_dma_tx_init();
     tim2_pwm_init();
-    pwm_set_percent(0);
-    dir_set(0);
+    adc1_dma_init_in8_in10();
+    tim6_init_1khz();
 
-    adc1_dma_init();
-    usart2_dma_init();
-    tim7_telemetry_init();
+    __enable_irq();
 
-    const char *banner = "Lab5 v15 ready (UART 1M). Type help\n";
-    usart2_tx_dma_send((const uint8_t*)banner, (uint32_t)strlen(banner));
+    const char *s = "\r\nCSV: target,current,control,error,rawExt,rawMotor\r\n";
+    uart2_send_dma(s, (uint16_t)strlen(s));
 
     while (1) {
         __WFI();
