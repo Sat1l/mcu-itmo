@@ -1,6 +1,8 @@
 #include "main.h"
+#include <stdio.h>
+#include <string.h>
 
-#define MIN_DUTY    150u
+#define MIN_DUTY    80u
 #define MAX_DUTY    999u
 
 static void delay_ms(uint32_t ms)
@@ -9,83 +11,89 @@ static void delay_ms(uint32_t ms)
     while ((millis - start) < ms) { /* wait */ }
 }
 
-/* 
-   GyverMotor2 - Advanced 2-wire logic for BTS7960
-   Forward:  L=0, R=PWM (Mode 1)
-   Backward: L=PWM, R=1 (Mode 2) -> creates negative voltage
-*/
 void motor_set_speed(int16_t speed)
 {
-    static int16_t last_speed = 0;
-    
-    // Safety: Brake before reversing direction
-    if ((last_speed > 0 && speed < 0) || (last_speed < 0 && speed > 0)) {
-        TIM1->CCR1 = 0;
-        TIM1->CCR2 = 0;
-        delay_ms(100);
-    }
-    last_speed = speed;
-
     if (speed == 0) {
         TIM1->CCR1 = 0;
         TIM1->CCR2 = 0;
         return;
     }
-
-    if (speed > 100) speed = 100;
-    if (speed < -100) speed = -100;
+    if (speed > 60) speed = 60;
+    if (speed < -60) speed = -60;
 
     uint32_t abs_speed = (speed > 0) ? speed : -speed;
     uint32_t duty = MIN_DUTY + (abs_speed * (MAX_DUTY - MIN_DUTY) / 100);
 
     if (speed > 0) {
-        // Forward (Mode 1): L=0, R=PWM
-        TIM1->CCR2 = 0;        // PA9
-        TIM1->CCR1 = duty;     // PA8
+        TIM1->CCR1 = duty;
+        TIM1->CCR2 = 0;
     } else {
-        // Backward (Mode 2): L=PWM, R=1
-        // V_motor = V_L - V_R = duty - 1 (Negative voltage)
-        TIM1->CCR1 = MAX_DUTY; // PA8
-        TIM1->CCR2 = duty;     // PA9
+        TIM1->CCR1 = 0;
+        TIM1->CCR2 = duty;
     }
 }
 
-void motor_brake(void)
+static void uart_init(void)
 {
-    // Active brake: both pins HIGH
-    TIM1->CCR1 = MAX_DUTY;
-    TIM1->CCR2 = MAX_DUTY;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+    GPIOA->CRL &= ~(0xFFu << 8);
+    GPIOA->CRL |= (0xBu << 8) | (0x4u << 12);
+
+    /* 
+       Baud rate 115200 @ 18MHz (PCLK1 is 18MHz due to DIV4 in system_init.c)
+       18000000 / (16 * 115200) = 9.765625
+       Mantissa = 9 (0x9)
+       Fraction = 0.765625 * 16 = 12.25 -> 12 (0xC)
+    */
+    USART2->BRR = (9u << 4) | 12u; 
+    USART2->CR1 |= USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+
+static void uart_send_string(const char *s)
+{
+    while (*s) {
+        while (!(USART2->SR & USART_SR_TXE));
+        USART2->DR = *s++;
+    }
 }
 
 static void gpio_init(void)
 {
     RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPCEN | RCC_APB2ENR_AFIOEN;
-    
-    // PA8, PA9 -> AF Output Push-Pull
     GPIOA->CRH &= ~(0xFFu << 0);
-    GPIOA->CRH |= (0xBBu << 0);
-
-    // PC13 -> LED
+    GPIOA->CRH |= (0xBBu << 0); // PA8, PA9 PWM
+    GPIOA->CRL &= ~(0xFFu << 0);
+    GPIOA->CRL |= (0x44u << 0); // PA0, PA1 Enc1
+    GPIOA->CRL &= ~(0xFFu << 24);
+    GPIOA->CRL &= ~(0xFFu << 28);
+    GPIOA->CRL |= (0x44u << 24) | (0x44u << 28); // PA6, PA7 Enc2
     GPIOC->CRH &= ~(0xFu << 20);
-    GPIOC->CRH |= (0x2u << 20);
+    GPIOC->CRH |= (0x2u << 20); // PC13 LED
 }
 
 static void tim1_pwm_init(void)
 {
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
-    TIM1->PSC = 71;
+    TIM1->PSC = 143; 
     TIM1->ARR = 999;
-
-    TIM1->CCMR1 &= ~(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);
     TIM1->CCMR1 |= (6u << TIM_CCMR1_OC1M_Pos) | (6u << TIM_CCMR1_OC2M_Pos);
-    TIM1->CCMR1 |= TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE;
-
-    TIM1->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P); 
     TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2E;
-
     TIM1->BDTR |= TIM_BDTR_MOE;
-    TIM1->EGR |= TIM_EGR_UG;
     TIM1->CR1 |= TIM_CR1_CEN;
+}
+
+static void tim_encoders_init(void)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN | RCC_APB1ENR_TIM3EN;
+    TIM2->ARR = 0xFFFF;
+    TIM2->SMCR |= (3u << TIM_SMCR_SMS_Pos);
+    TIM2->CCMR1 |= (1u << TIM_CCMR1_CC1S_Pos) | (1u << TIM_CCMR1_CC2S_Pos);
+    TIM2->CR1 |= TIM_CR1_CEN;
+    TIM3->ARR = 0xFFFF;
+    TIM3->SMCR |= (3u << TIM_SMCR_SMS_Pos);
+    TIM3->CCMR1 |= (1u << TIM_CCMR1_CC1S_Pos) | (1u << TIM_CCMR1_CC2S_Pos);
+    TIM3->CR1 |= TIM_CR1_CEN;
 }
 
 extern void enable_systick(void);
@@ -94,32 +102,58 @@ int main(void)
 {
     enable_systick();
     gpio_init();
+    uart_init();
     tim1_pwm_init();
+    tim_encoders_init();
+
+    float kp = 0.8f;
+    float ki = 0.05f;
+    float kd = 1.2f;
+    float integral = 0;
+    float last_error = 0;
+    const int16_t deadzone = 4;
+
+    uint32_t last_telemetry = 0;
+    int16_t last_motor_pos = 0;
 
     while (1)
     {
-        // 1. Slow Forward (Speed 20)
-        GPIOC->BRR = (1u << 13); // LED ON
-        motor_set_speed(20);
-        delay_ms(2000);
+        int16_t target_pos = (int16_t)TIM3->CNT;
+        int16_t current_pos = (int16_t)TIM2->CNT;
+        float error = (float)(target_pos - current_pos);
 
-        // 2. Full Forward (Speed 100)
-        motor_set_speed(100);
-        delay_ms(2000);
+        if (error > -deadzone && error < deadzone) error = 0;
+        if (error != 0) integral += error;
+        else integral *= 0.8f;
+        
+        if (integral > 300) integral = 300;
+        if (integral < -300) integral = -300;
 
-        // 3. Active Brake
-        GPIOC->BSRR = (1u << 13); // LED OFF
-        motor_brake();
-        delay_ms(2000);
+        float derivative = error - last_error;
+        last_error = error;
 
-        // 4. Backward (Speed -50)
-        GPIOC->BRR = (1u << 13); // LED ON
-        motor_set_speed(-50);
-        delay_ms(2000);
+        float output = (kp * error) + (ki * integral) + (kd * derivative);
+        motor_set_speed((int16_t)output);
 
-        // 5. Stop (Passive)
-        GPIOC->BSRR = (1u << 13); // LED OFF
-        motor_set_speed(0);
-        delay_ms(2000);
+        // Telemetry loop (every 50ms)
+        if ((millis - last_telemetry) > 50) {
+            // Speed calculation: delta_pos per 50ms
+            int16_t speed = current_pos - last_motor_pos;
+            last_motor_pos = current_pos;
+
+            char buf[128];
+            // Format for SerialPlot: Target,Current,Speed,Error,Output
+            sprintf(buf, "%d,%d,%d,%d,%d\r\n", target_pos, current_pos, speed, (int16_t)error, (int16_t)output);
+            uart_send_string(buf);
+            last_telemetry = millis;
+        }
+
+        static uint32_t last_blink = 0;
+        uint32_t blink_period = (error == 0) ? 500 : 100;
+        if ((millis - last_blink) > blink_period) {
+            GPIOC->ODR ^= (1u << 13);
+            last_blink = millis;
+        }
+        delay_ms(10);
     }
 }
