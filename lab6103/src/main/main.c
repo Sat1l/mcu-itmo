@@ -5,7 +5,6 @@
 #define MIN_DUTY    80u
 #define MAX_DUTY    999u
 
-// Глобальные переменные для взаимодействия с прерыванием
 volatile int16_t g_target_pos = 0;
 volatile int16_t g_current_pos = 0;
 volatile int16_t g_speed = 0;
@@ -71,7 +70,7 @@ static void tim_init_all(void)
 {
     // 1. TIM1 - PWM @ 1kHz
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
-    TIM1->PSC = 71; 
+    TIM1->PSC = 71;
     TIM1->ARR = 999;
     TIM1->CCMR1 |= (6u << TIM_CCMR1_OC1M_Pos) | (6u << TIM_CCMR1_OC2M_Pos);
     TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2E;
@@ -99,7 +98,6 @@ static void tim_init_all(void)
     NVIC_EnableIRQ(TIM4_IRQn);
 }
 
-// Прерывание таймера TIM4 (выполняется каждые 10 мс)
 void TIM4_IRQHandler(void)
 {
     if (TIM4->SR & TIM_SR_UIF) {
@@ -107,23 +105,21 @@ void TIM4_IRQHandler(void)
 
         static int16_t last_pos = 0;
         static uint8_t telemetry_cnt = 0;
-        
-        // PID Parameters
+
+        // параметры пида
         static float kp = 0.8f, ki = 0.05f, kd = 1.2f;
         static float integral = 0, last_error = 0;
 
-        // 1. Читаем данные
         g_target_pos = (int16_t)TIM3->CNT;
         g_current_pos = (int16_t)TIM2->CNT;
-        
-        // 2. Считаем скорость
+
         g_speed = g_current_pos - last_pos;
         last_pos = g_current_pos;
 
-        // 3. ПИД-регулятор
+        // 3. пид
         float err = (float)(g_target_pos - g_current_pos);
-        if (err > -4 && err < 4) err = 0; // Deadzone
-        
+        if (err > -4 && err < 4) err = 0; // дедзона
+
         if (err != 0) integral += err;
         else integral *= 0.8f;
         if (integral > 300) integral = 300;
@@ -134,8 +130,7 @@ void TIM4_IRQHandler(void)
 
         g_error = (int16_t)err;
         g_output = (int16_t)((kp * err) + (ki * integral) + (kd * derivative));
-        
-        // 4. Управление мотором
+
         motor_set_speed(g_output);
 
         // 5. Флаг телеметрии каждые 50мс (каждый 5-й вызов)
@@ -162,8 +157,8 @@ int main(void)
             char buf[128];
             sprintf(buf, "%d,%d,%d,%d,%d\r\n", g_target_pos, g_current_pos, g_speed, g_error, g_output);
             uart_send_string(buf);
-            
-            // LED Heartbeat inside telemetry sync
+
+            // sanity-check моргание диодом
             static uint32_t last_blink = 0;
             uint32_t blink_p = (g_error == 0) ? 500 : 100;
             if ((millis - last_blink) > blink_p) {
