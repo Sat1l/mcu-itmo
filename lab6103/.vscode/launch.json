@@ -1,0 +1,27 @@
+{
+  "version": "1.2.0",
+  "configurations": [
+    {
+      "device": "STM32F466RET6",
+      "name": "ST-Link-OCD",
+      "cwd": "${workspaceFolder}",
+      "executable": "build/STM32_template.elf",
+      "request": "launch",
+      "type": "cortex-debug",
+      "interface": "swd",
+      "runToEntryPoint": "main",
+      "servertype": "openocd",
+      "liveWatch": {
+        "enabled": true,
+        "samplesPerSecond": 10
+      },
+      // "preLaunchTask": "Flash",
+      "svdPath": "/Users/sat/STM32/drivers/STM32F4/STM32F4_svd_V1.2/STM32F466.svd",
+      // https://www.st.com/en/microcontrollers-microprocessors/stm32-32-bit-arm-cortex-mcus.html#cad-resources
+      "configFiles": [
+        "/opt/homebrew/opt/openocd/share/openocd/scripts/interface/stlink-v2-1.cfg",
+        "/opt/homebrew/opt/openocd/share/openocd/scripts/target/stm32f1x.cfg"
+      ]
+    }
+  ]
+}

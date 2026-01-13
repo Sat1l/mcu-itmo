@@ -1,0 +1,46 @@
+{
+    "cmake.configureOnOpen": false,
+    "cmake.configureSettings": {
+		"project_name": "${workspaceFolderBasename}",
+	},
+
+    "cortex-debug.armToolchainPath": "/opt/homebrew/bin",
+    "cortex-debug.stlinkPath": "/opt/homebrew/bin/", 
+    "cortex-debug.openocdPath": "/opt/homebrew/bin/openocd",
+    "cortex-debug.gdbPath": "/opt/homebrew/bin/arm-none-eabi-gdb",
+
+    "VsCodeTaskButtons.tasks": [
+        {
+            "label": "$(checklist) Build",
+            "task": "Build",
+            "tooltip": "Start the \"build\" task"
+        },
+		{
+            "label": "$(run) Flash",
+            "task": "Flash",
+            "tooltip": "Build, flash and run"
+        },
+        {
+            "label": "$(clear-all) Clean",
+            "task": "Clean",
+            "tooltip": "Start a \"clean\" task"
+        },
+		{
+            "label": "$(close) Erase",
+            "task": "Erase",
+            "tooltip": "Full chip erase"
+        },
+    ],
+    "files.associations": {
+        "stdlib.h": "c",
+        "main.h": "c",
+        "usart1.h": "c",
+        "stm32f103xb.h": "c",
+        "config.h": "c",
+        "string.h": "c",
+        "cli.h": "c",
+        "chrono": "c",
+        "typeinfo": "c",
+        "stdbool.h": "c"
+    }
+}
