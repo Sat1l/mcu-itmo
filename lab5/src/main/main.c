@@ -16,25 +16,8 @@
 #define TIM6_PSC            89UL
 #define TIM6_ARR            999UL
 
-#define ADC_LEN             2U
-#define ADC_IDX_EXT         0U   // PB0  ADC1_IN8
-#define ADC_IDX_MOTOR       1U   // PC0  ADC1_IN10
-
-#define ADC_MAX_F           4095.0f
-#define DEG_MAX_F           270.0f
-
-#define INVERT_TARGET       1
-#define INVERT_MOTOR        0
-
-#define LIM_MIN_DEG         5.0f
-#define LIM_MAX_DEG         265.0f
-
-#define DEAD_ZONE_DEG       1.0f
-#define MIN_CMD_PCT         12.0f
-
-#define FILT_A              0.05f
-
-static volatile uint16_t adc_buf[ADC_LEN];
+static uint16_t adc_val_ext = 0;
+static uint16_t adc_val_motor = 0;
 
 static char tx_buf[128];
 
@@ -107,44 +90,25 @@ static void tim2_pwm_init(void) {
     TIM2->CR1 |= TIM_CR1_ARPE | TIM_CR1_CEN;
 }
 
-static void adc1_dma_init_in8_in10(void) {
+static void adc1_init(void) {
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
-    RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;
 
     ADC->CCR &= ~ADC_CCR_ADCPRE_Msk;
-    ADC->CCR |=  ADC_CCR_ADCPRE_0;
+    ADC->CCR |=  ADC_CCR_ADCPRE_0; // ADCCLK = 90MHz / 4 = 22.5MHz (max 36MHz)
 
-    DMA2_Stream0->CR &= ~DMA_SxCR_EN;
-    while (DMA2_Stream0->CR & DMA_SxCR_EN) {}
-    DMA2->LIFCR = DMA_LIFCR_CTCIF0 | DMA_LIFCR_CHTIF0 | DMA_LIFCR_CTEIF0 |
-                  DMA_LIFCR_CDMEIF0 | DMA_LIFCR_CFEIF0;
+    ADC1->CR1 = 0;
+    ADC1->CR2 = ADC_CR2_ADON;
 
-    DMA2_Stream0->PAR  = (uint32_t)&ADC1->DR;
-    DMA2_Stream0->M0AR = (uint32_t)adc_buf;
-    DMA2_Stream0->NDTR = ADC_LEN;
+    // Sample time 56 cycles for IN8 (PB0) and IN10 (PC0)
+    ADC1->SMPR2 |= (3UL << (8 * 3));  // Ch 8
+    ADC1->SMPR1 |= (3UL << (0 * 3));  // Ch 10
+}
 
-    DMA2_Stream0->CR = (0UL << DMA_SxCR_CHSEL_Pos) |
-                       (0UL << DMA_SxCR_DIR_Pos)   |
-                       DMA_SxCR_MINC | DMA_SxCR_CIRC |
-                       (1UL << DMA_SxCR_PL_Pos) |
-                       DMA_SxCR_MSIZE_0 | DMA_SxCR_PSIZE_0;
-    DMA2_Stream0->FCR = 0;
-
-    ADC1->CR1 = ADC_CR1_SCAN;
-
-    ADC1->SMPR2 = 0;
-    ADC1->SMPR1 = 0;
-    ADC1->SMPR2 |= (7UL << (3U * 8U));
-    ADC1->SMPR1 |= (7UL << (3U * 0U));
-
-    ADC1->SQR1 = (1UL << 20);
-    ADC1->SQR3 = (8UL << 0) | (10UL << 5);
-
-    ADC1->CR2 = ADC_CR2_CONT | ADC_CR2_DMA | ADC_CR2_DDS | ADC_CR2_EOCS;
-
-    DMA2_Stream0->CR |= DMA_SxCR_EN;
-    ADC1->CR2 |= ADC_CR2_ADON;
+static uint16_t adc_read(uint32_t channel) {
+    ADC1->SQR3 = channel;
     ADC1->CR2 |= ADC_CR2_SWSTART;
+    while (!(ADC1->SR & ADC_SR_EOC)) {}
+    return (uint16_t)ADC1->DR;
 }
 
 static void usart2_init(void) {
@@ -192,7 +156,7 @@ static void motor_set(int16_t spd) {
         return;
     }
 
-    if (mag < (uint32_t)MIN_CMD_PCT) mag = (uint32_t)MIN_CMD_PCT;
+    if (mag < 12) mag = 12; // min duty to move motor
 
     uint32_t duty = (mag * (PWM_ARR + 1UL)) / 100UL;
     if (duty > PWM_ARR) duty = PWM_ARR;
@@ -213,8 +177,8 @@ static void telemetry_send(void) {
     char *p = tx_buf;
     uint16_t n = 0;
 
-    n += u32_to_dec(p + n, adc_buf[ADC_IDX_EXT]); p[n++] = ',';
-    n += u32_to_dec(p + n, adc_buf[ADC_IDX_MOTOR]);
+    n += u32_to_dec(p + n, adc_val_ext); p[n++] = ',';
+    n += u32_to_dec(p + n, adc_val_motor);
 
     p[n++] = '\r';
     p[n++] = '\n';
@@ -223,18 +187,17 @@ static void telemetry_send(void) {
 }
 
 static void ctrl_step(void) {
-    float ext = ((float)adc_buf[ADC_IDX_EXT]   * DEG_MAX_F) / ADC_MAX_F;
-    float mot = ((float)adc_buf[ADC_IDX_MOTOR] * DEG_MAX_F) / ADC_MAX_F;
+    adc_val_ext = adc_read(8);
+    adc_val_motor = adc_read(10);
 
-#if INVERT_TARGET
-    ext = DEG_MAX_F - ext;
-#endif
-#if INVERT_MOTOR
-    mot = DEG_MAX_F - mot;
-#endif
+    float ext = ((float)adc_val_ext   * 270.0f) / 4095.0f;
+    float mot = ((float)adc_val_motor * 270.0f) / 4095.0f;
 
-    ext_f += FILT_A * (ext - ext_f);
-    mot_f += FILT_A * (mot - mot_f);
+    // Invert target (standard for our setup)
+    ext = 270.0f - ext;
+
+    ext_f += 0.05f * (ext - ext_f);
+    mot_f += 0.05f * (mot - mot_f);
 
     target_deg = ext_f;
     motor_deg  = mot_f;
@@ -244,7 +207,7 @@ static void ctrl_step(void) {
     float out = 0.0f;
 
     float ae = fabsf(err_deg);
-    if (ae < DEAD_ZONE_DEG) {
+    if (ae < 1.0f) { // deadzone
         out = 0.0f;
     } else {
         if (ae > 50.0f) out = 100.0f;
@@ -252,8 +215,8 @@ static void ctrl_step(void) {
         out = copysignf(out, err_deg);
     }
 
-    if (motor_deg <= LIM_MIN_DEG && out < 0.0f) out = 0.0f;
-    if (motor_deg >= LIM_MAX_DEG && out > 0.0f) out = 0.0f;
+    if (motor_deg <= 5.0f && out < 0.0f) out = 0.0f;
+    if (motor_deg >= 265.0f && out > 0.0f) out = 0.0f;
 
     control = (int16_t)lroundf(out);
     motor_set(control);
@@ -281,7 +244,7 @@ int main(void) {
     gpio_init();
     usart2_init();
     tim2_pwm_init();
-    adc1_dma_init_in8_in10();
+    adc1_init();
     tim6_init_1khz();
 
     __enable_irq();
