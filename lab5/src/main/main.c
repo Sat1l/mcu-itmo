@@ -176,12 +176,32 @@ static uint16_t u32_to_dec(char *p, uint32_t v) {
     return n;
 }
 
+static uint16_t i32_to_dec(char *p, int32_t v) {
+    uint16_t n = 0;
+    if (v < 0) { p[n++] = '-'; v = -v; }
+    n += u32_to_dec(p + n, (uint32_t)v);
+    return n;
+}
+
+static uint16_t float_to_str(char *p, float f) {
+    int32_t v = (int32_t)(f * 10.0f);
+    uint16_t n = i32_to_dec(p, v / 10);
+    p[n++] = '.';
+    int32_t frac = v % 10;
+    if (frac < 0) frac = -frac;
+    p[n++] = (char)('0' + frac);
+    return n;
+}
+
 static void telemetry_send(void) {
     char *p = tx_buf;
     uint16_t n = 0;
 
-    n += u32_to_dec(p + n, adc_buf[0]); p[n++] = ',';
-    n += u32_to_dec(p + n, adc_buf[1]);
+    // Положение сервопривода, положение задающего потенциометра, управление, ошибка
+    n += float_to_str(p + n, motor_deg); p[n++] = ',';
+    n += float_to_str(p + n, target_deg); p[n++] = ',';
+    n += i32_to_dec(p + n, (int32_t)control); p[n++] = ',';
+    n += float_to_str(p + n, err_deg);
 
     p[n++] = '\r';
     p[n++] = '\n';
@@ -193,7 +213,6 @@ static void ctrl_step(void) {
     float ext = ((float)adc_buf[0] * 270.0f) / 4095.0f;
     float mot = ((float)adc_buf[1] * 270.0f) / 4095.0f;
 
-    // Invert target (standard for our setup)
     ext = 270.0f - ext;
 
     ext_f += 0.05f * (ext - ext_f);
