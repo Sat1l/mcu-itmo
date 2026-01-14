@@ -100,7 +100,6 @@ int main(void) {
     TIM5->PSC = 8999; TIM5->ARR = 99; TIM5->DIER = TIM_DIER_UIE; TIM5->CR1 = TIM_CR1_CEN;
     NVIC_EnableIRQ(TIM5_IRQn);
     ext_zero = TIM4->CNT;
-    usart2_send_str("Lab6 ready\r\n");
     while (1) {
         if (telemetry_flag) {
             telemetry_flag = 0;
