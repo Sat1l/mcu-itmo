@@ -16,8 +16,7 @@
 #define TIM6_PSC            89UL
 #define TIM6_ARR            999UL
 
-static uint16_t adc_val_ext = 0;
-static uint16_t adc_val_motor = 0;
+static volatile uint16_t adc_buf[2];
 
 static char tx_buf[128];
 
@@ -90,25 +89,29 @@ static void tim2_pwm_init(void) {
     TIM2->CR1 |= TIM_CR1_ARPE | TIM_CR1_CEN;
 }
 
-static void adc1_init(void) {
+static void adc1_dma_init(void) {
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+    RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;
 
     ADC->CCR &= ~ADC_CCR_ADCPRE_Msk;
-    ADC->CCR |=  ADC_CCR_ADCPRE_0; // ADCCLK = 90MHz / 4 = 22.5MHz (max 36MHz)
+    ADC->CCR |=  ADC_CCR_ADCPRE_0; // ADCCLK = 90MHz / 4 = 22.5MHz
 
-    ADC1->CR1 = 0;
-    ADC1->CR2 = ADC_CR2_ADON;
+    DMA2_Stream0->CR &= ~DMA_SxCR_EN;
+    while (DMA2_Stream0->CR & DMA_SxCR_EN) {}
 
-    // Sample time 56 cycles for IN8 (PB0) and IN10 (PC0)
-    ADC1->SMPR2 |= (3UL << (8 * 3));  // Ch 8
-    ADC1->SMPR1 |= (3UL << (0 * 3));  // Ch 10
-}
+    DMA2_Stream0->PAR  = (uint32_t)&ADC1->DR;
+    DMA2_Stream0->M0AR = (uint32_t)adc_buf;
+    DMA2_Stream0->NDTR = 2;
+    DMA2_Stream0->CR = (0UL << DMA_SxCR_CHSEL_Pos) | DMA_SxCR_MINC | DMA_SxCR_CIRC | (1UL << DMA_SxCR_PSIZE_Pos) | (1UL << DMA_SxCR_MSIZE_Pos);
+    DMA2_Stream0->CR |= DMA_SxCR_EN;
 
-static uint16_t adc_read(uint32_t channel) {
-    ADC1->SQR3 = channel;
+    ADC1->CR1 = ADC_CR1_SCAN;
+    ADC1->SMPR2 = (3UL << (8 * 3));
+    ADC1->SMPR1 = (3UL << (0 * 3));
+    ADC1->SQR1 = (1UL << 20); // 2 conversions
+    ADC1->SQR3 = (8UL << 0) | (10UL << 5);
+    ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_CONT | ADC_CR2_DMA | ADC_CR2_DDS;
     ADC1->CR2 |= ADC_CR2_SWSTART;
-    while (!(ADC1->SR & ADC_SR_EOC)) {}
-    return (uint16_t)ADC1->DR;
 }
 
 static void usart2_init(void) {
@@ -177,8 +180,8 @@ static void telemetry_send(void) {
     char *p = tx_buf;
     uint16_t n = 0;
 
-    n += u32_to_dec(p + n, adc_val_ext); p[n++] = ',';
-    n += u32_to_dec(p + n, adc_val_motor);
+    n += u32_to_dec(p + n, adc_buf[0]); p[n++] = ',';
+    n += u32_to_dec(p + n, adc_buf[1]);
 
     p[n++] = '\r';
     p[n++] = '\n';
@@ -187,11 +190,8 @@ static void telemetry_send(void) {
 }
 
 static void ctrl_step(void) {
-    adc_val_ext = adc_read(8);
-    adc_val_motor = adc_read(10);
-
-    float ext = ((float)adc_val_ext   * 270.0f) / 4095.0f;
-    float mot = ((float)adc_val_motor * 270.0f) / 4095.0f;
+    float ext = ((float)adc_buf[0] * 270.0f) / 4095.0f;
+    float mot = ((float)adc_buf[1] * 270.0f) / 4095.0f;
 
     // Invert target (standard for our setup)
     ext = 270.0f - ext;
@@ -244,7 +244,7 @@ int main(void) {
     gpio_init();
     usart2_init();
     tim2_pwm_init();
-    adc1_init();
+    adc1_dma_init();
     tim6_init_1khz();
 
     __enable_irq();
