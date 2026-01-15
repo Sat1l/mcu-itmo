@@ -41,6 +41,8 @@
         "cli.h": "c",
         "chrono": "c",
         "typeinfo": "c",
-        "stdbool.h": "c"
+        "stdbool.h": "c",
+        "stdint.h": "c",
+        "stm32f446xx.h": "c"
     }
 }
