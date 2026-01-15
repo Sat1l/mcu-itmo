@@ -89,7 +89,6 @@ static void pwm_set(uint8_t pct) {
 
 static void dir_set(uint8_t dir) {
     dir_state = !!dir;
-    // Инвертировал логику: теперь dir=1 -> LOW, dir=0 -> HIGH (или наоборот, если было не так)
     if (dir_state) DIR_PORT->BSRR = (1U << (DIR_PIN + 16U));
     else DIR_PORT->BSRR = (1U << DIR_PIN);
 }
@@ -98,13 +97,13 @@ void TIM5_IRQHandler(void) {
     if (TIM5->SR & TIM_SR_UIF) {
         TIM5->SR &= ~TIM_SR_UIF;
         
-        // 1. Читаем ручку
+        // 1. считываем энкодер
         int16_t knob = (int16_t)TIM4->CNT;
         if (knob > 300) { knob = 300; TIM4->CNT = 300; }
         else if (knob < -300) { knob = -300; TIM4->CNT = (uint32_t)(int16_t)-300; }
         target_rpm = (float)knob;
 
-        // 2. Считаем скорость
+        // 2. считываем скорость
         static int16_t last_cnt = 0;
         int16_t cur_cnt = (int16_t)TIM2->CNT;
         int16_t delta = cur_cnt - last_cnt;
