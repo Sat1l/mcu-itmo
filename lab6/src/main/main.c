@@ -9,15 +9,20 @@
 #define UART_BAUD           115200U
 #define PWM_HZ              1000U
 
+// --- НАСТРОЙКА МОТОРА ---
+// Укажите количество импульсов на один полный оборот вала (с учетом редуктора)
+// Обычно это значение от 400 до 2000.
+#define MOTOR_PPR           1000.0f 
+
 #define DIR_PORT            GPIOB
-#define DIR_PIN             5U          // PB5 = DIR1
+#define DIR_PIN             5U
 #define PWM_PORT            GPIOB
-#define PWM_PIN             4U          // PB4 = EN1 (PWM)
+#define PWM_PIN             4U
 #define UART_TX_PORT        GPIOA
 #define UART_TX_PIN         2U
 
-static volatile int32_t ext_zero = 0;
-static volatile int16_t target_pct = 0;
+static volatile float target_rpm = 0;
+static volatile float current_rpm = 0;
 static volatile uint8_t pwm_pct = 0;
 static volatile uint8_t dir_state = 0;
 static volatile uint8_t telemetry_flag = 0;
@@ -47,10 +52,10 @@ static void gpio_init(void) {
     DIR_PORT->MODER |= (1U << (DIR_PIN * 2U));
     PWM_PORT->MODER |= (2U << (PWM_PIN * 2U));
     PWM_PORT->AFR[0] |= (2U << (PWM_PIN * 4U));
-    GPIOA->MODER |= (2U << (0 * 2U)) | (2U << (1 * 2U)); // TIM2
+    GPIOA->MODER |= (2U << (0 * 2U)) | (2U << (1 * 2U));
     GPIOA->AFR[0] |= (1U << (0 * 4U)) | (1U << (1 * 4U));
     GPIOA->PUPDR |= (1U << (0 * 2U)) | (1U << (1 * 2U));
-    GPIOB->MODER |= (2U << (6 * 2U)) | (2U << (7 * 2U)); // TIM4
+    GPIOB->MODER |= (2U << (6 * 2U)) | (2U << (7 * 2U));
     GPIOB->AFR[0] |= (2U << (6 * 4U)) | (2U << (7 * 4U));
     GPIOB->PUPDR |= (1U << (6 * 2U)) | (1U << (7 * 2U));
     UART_TX_PORT->MODER |= (2U << (UART_TX_PIN * 2U));
@@ -77,17 +82,57 @@ static void dir_set(uint8_t dir) {
 void TIM5_IRQHandler(void) {
     if (TIM5->SR & TIM_SR_UIF) {
         TIM5->SR &= ~TIM_SR_UIF;
-        int32_t diff = (int16_t)TIM4->CNT - (int16_t)ext_zero;
-        if (diff > 100) diff = 100; else if (diff < -100) diff = -100;
-        target_pct = (int16_t)diff;
-        if (target_pct >= 0) { dir_set(1); pwm_set(target_pct); }
-        else { dir_set(0); pwm_set(-target_pct); }
-        static uint8_t cnt = 0;
-        if (++cnt >= 5) { cnt = 0; telemetry_flag = 1; }
+        
+        // 1. Считываем цель в RPM с ручки (-200...200 RPM, например)
+        int16_t knob = (int16_t)TIM4->CNT;
+        if (knob > 250) { knob = 250; TIM4->CNT = 250; }
+        else if (knob < -250) { knob = -250; TIM4->CNT = (uint32_t)(int16_t)-250; }
+        target_rpm = (float)knob;
+
+        // 2. Расчет текущей скорости в RPM
+        static int16_t last_m_cnt = 0;
+        int16_t cur_m_cnt = (int16_t)TIM2->CNT;
+        int16_t diff_10ms = cur_m_cnt - last_m_cnt;
+        last_m_cnt = cur_m_cnt;
+        
+        // RPM = (ticks_10ms / PPR) * 100 (steps/sec) * 60 (sec/min)
+        float inst_rpm = ((float)diff_10ms / MOTOR_PPR) * 6000.0f;
+
+        // 3. ПИ-регулятор скорости (работает на частоте 100 Гц)
+        static float integral = 0;
+        float error = target_rpm - inst_rpm;
+        
+        // Коэффициенты для RPM (нужно подбирать под мотор)
+        float Kp = 0.15f; 
+        float Ki = 0.08f;
+        
+        integral += error * Ki;
+        if (integral > 100.0f) integral = 100.0f;
+        else if (integral < -100.0f) integral = -100.0f;
+
+        float output = error * Kp + integral;
+        if (output > 100.0f) output = 100.0f;
+        else if (output < -100.0f) output = -100.0f;
+
+        // 4. Установка на мотор
+        if (output >= 0) { dir_set(1); pwm_set((uint8_t)output); }
+        else { dir_set(0); pwm_set((uint8_t)(-output)); }
+
+        // 5. Телеметрия (усредняем для вывода раз в 50мс)
+        static uint8_t t_cnt = 0;
+        static int16_t last_m_tele = 0;
+        if (++t_cnt >= 5) {
+            t_cnt = 0;
+            int16_t diff_50ms = cur_m_cnt - last_m_tele;
+            last_m_tele = cur_m_cnt;
+            current_rpm = ((float)diff_50ms / MOTOR_PPR) * 1200.0f;
+            telemetry_flag = 1;
+        }
     }
 }
 
 int main(void) {
+    SCB->CPACR |= (3UL << (10U * 2U)) | (3UL << (11U * 2U)); // Включаем FPU
     clock_180mhz_hse18();
     gpio_init();
     usart2_init();
@@ -99,12 +144,13 @@ int main(void) {
     TIM4->SMCR = 3; TIM4->CCMR1 = 0x0101; TIM4->CR1 = TIM_CR1_CEN;
     TIM5->PSC = 8999; TIM5->ARR = 99; TIM5->DIER = TIM_DIER_UIE; TIM5->CR1 = TIM_CR1_CEN;
     NVIC_EnableIRQ(TIM5_IRQn);
-    ext_zero = TIM4->CNT;
+    TIM4->CNT = 0;
     while (1) {
         if (telemetry_flag) {
             telemetry_flag = 0;
             char out[64];
-            sprintf(out, "%d,%d,%u,%u\r\n", (int)(int16_t)TIM4->CNT, (int)(int16_t)TIM2->CNT, pwm_pct, dir_state);
+            // Вывод: [Реальный_RPM],[Заданный_RPM]
+            sprintf(out, "%.1f,%.1f\r\n", current_rpm, target_rpm);
             usart2_send_str(out);
         }
     }
